@@ -207,6 +207,15 @@ open class ChatCaptureService : AccessibilityService() {
         if (!prefs.enabled) { leaveConversation(); overlay?.hide(); return }
 
         val type = event.eventType
+        // #18-4: our own overlay redraws ("generating…" → judgment → candidates)
+        // emit WINDOW_CONTENT_CHANGED / VIEW_SCROLLED carrying our package name.
+        // Reacting to them woke the service in a loop: re-read → re-analyze →
+        // redraw → …, which pinned the panel on "generating" forever. Window-state
+        // events keep flowing: the fg == packageName branch above still hides the
+        // bubble inside our own settings screens.
+        if (event.packageName?.toString() == packageName &&
+            (type == AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED ||
+             type == AccessibilityEvent.TYPE_VIEW_SCROLLED)) return
         // Decide "did we leave the chat app" from the REAL active window, not the
         // event's package. The event package can be an IME (e.g. com.tencent.wetype)
         // or the status bar while the chat app is still foreground — keying off it
