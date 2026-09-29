@@ -44,6 +44,8 @@ internal class ConversationSession {
         return token()
     }
 
-    fun accepts(token: Token): Boolean =
-        token.target.sameConversation(target ?: return false) && token.revision == revision
+    fun accepts(token: Token): Boolean {
+        val current = target ?: return false
+        return token.target.sameConversation(current) && token.revision == revision
+    }
 }
