@@ -7,6 +7,7 @@ import android.graphics.Rect
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
@@ -21,9 +22,12 @@ import com.jev.probe.core.kb.ContextBuilder
 import com.jev.probe.core.kb.KbStore
 import com.jev.probe.jev.JevClient
 import com.jev.probe.overlay.OverlayController
+import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /**
  * The live capture service (registered under a disguised class name so WeChat
@@ -43,6 +47,33 @@ open class ChatCaptureService : AccessibilityService() {
 
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newFixedThreadPool(2)
+
+    /** Judge/reply HTTP runs here under a hard watchdog (see [withHardTimeout]).
+     *  Cached so an abandoned request — interrupts do not break a wedged socket
+     *  read — never blocks the next round's threads. */
+    private val analysisPool = Executors.newCachedThreadPool { r ->
+        Thread(r, "jev-http").apply { isDaemon = true }
+    }
+
+    /**
+     * Run [body] on [analysisPool] but never wait longer than [ms].
+     *
+     * HttpURLConnection bounds connect/read per attempt yet NOT DNS resolution
+     * (and some OEM stacks stall connects beyond both), so one wedged request
+     * used to hold its round's callback forever: the panel stayed on 生成中 and
+     * the round's [analyzing] flag never dropped, silently discarding every
+     * later analysis. Past the ceiling we abandon the attempt and surface a
+     * plain, retryable error instead.
+     */
+    private fun <T> withHardTimeout(ms: Long, what: String, body: () -> T): T {
+        val f = analysisPool.submit(Callable { body() })
+        return try {
+            f.get(ms, TimeUnit.MILLISECONDS)
+        } catch (e: TimeoutException) {
+            f.cancel(true)
+            throw java.io.IOException("$what 超时（${ms / 1000}秒），请检查网络后重试")
+        }
+    }
 
     /** Adapted chat apps, keyed by package name.
      *  WeChat is intentionally NOT wired in: reading it (node tree / screenshot /
@@ -409,7 +440,12 @@ open class ChatCaptureService : AccessibilityService() {
 
     private fun runAnalysis() {
         val snapshot = pendingSnapshot ?: return
-        if (analyzing || destroyed || !prefs.enabled) return
+        if (analyzing || destroyed || !prefs.enabled) {
+            // A lost round used to strand analyzing=true here forever, with
+            // nothing in logcat saying why updates stopped — never again.
+            if (analyzing) Log.w(TAG, "round skipped: previous round still in flight")
+            return
+        }
         val previous = session.token() ?: return
         if (!isCurrent(previous)) return
         if (!prefs.hasKey()) { overlay?.showError("未设置判断接口密钥，去设置里填"); return }
@@ -437,26 +473,45 @@ open class ChatCaptureService : AccessibilityService() {
                     }
                 }
                 submitAnalysis {
-                    val judgment = client.judge(snapshot, rel, ctx)
+                    val judgment = try {
+                        withHardTimeout(ROUND_TIMEOUT_MS, "判断接口") { client.judge(snapshot, rel, ctx) }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "judge round failed: ${e.message}")
+                        null
+                    }
                     main.post {
                         if (isCurrent(token)) {
-                            if (judgment.error != null) overlay?.showError(judgment.error)
-                            else overlay?.showJudgment(judgment)
-                            completed()
+                            when {
+                                judgment == null -> overlay?.showError("判断接口超时，请重试")
+                                judgment.error != null -> overlay?.showError(judgment.error)
+                                else -> overlay?.showJudgment(judgment)
+                            }
                         }
+                        // Outside the guard: a stale session must never strand
+                        // analyzing=true — that bricked every later round.
+                        completed()
                     }
                 }
                 submitAnalysis {
                     var replyError: String? = null
-                    val ranked = try { client.draftAndRank(snapshot, rel, ctx) } catch (e: Exception) {
+                    val t0 = SystemClock.elapsedRealtime()
+                    val ranked = try {
+                        withHardTimeout(ROUND_TIMEOUT_MS, "回复接口") {
+                            client.draftAndRank(snapshot, rel, ctx)
+                        }
+                    } catch (e: Exception) {
                         replyError = e.message ?: e.javaClass.simpleName
+                        Log.w(TAG, "reply failed after ${SystemClock.elapsedRealtime() - t0}ms: $replyError")
                         emptyList()
+                    }
+                    if (replyError == null) {
+                        Log.i(TAG, "reply ok after ${SystemClock.elapsedRealtime() - t0}ms ranked=${ranked.size}")
                     }
                     main.post {
                         if (isCurrent(token)) {
                             overlay?.showReplies(ranked, replyError) { text -> fillInput(token, text) }
-                            completed()
                         }
+                        completed() // outside the guard: see the judge round
                     }
                 }
             }
@@ -764,6 +819,14 @@ open class ChatCaptureService : AccessibilityService() {
 
     companion object {
         private const val TAG = "JEVASSIST"
+
+        /** Hard ceiling on one round's judge/reply HTTP. HttpURLConnection bounds
+         *  connect/read per attempt but NOT DNS resolution, so a wedged lookup
+         *  could hold a round's callback forever (panel stuck on 生成中, every
+         *  later round silently dropped). Deliberately shorter than HttpJson's
+         *  own worst retry tail (~165s): a reply that takes >2min is worthless
+         *  anyway — better a clear timeout the user can retry from. */
+        private const val ROUND_TIMEOUT_MS = 120_000L
 
         /** WeChat's package. Reading it (node tree / screenshot / OCR) is what
          *  trips WeChat's anti-screenshot risk control, so it is fully disabled:
