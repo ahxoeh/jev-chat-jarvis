@@ -124,7 +124,8 @@ open class ChatCaptureService : AccessibilityService() {
     private fun isCurrent(token: ConversationSession.Token): Boolean {
         if (destroyed || !prefs.enabled || !session.accepts(token)) return false
         val live = rootInActiveWindow?.let { targetFor(it) }
-        if (live != token.target || !prefs.isAllowed(currentSnapshot?.title ?: live.title)) {
+        if (live == null || !live.sameConversation(token.target) ||
+            !prefs.isAllowed(currentSnapshot?.title ?: live.title)) {
             leaveConversation()
             overlay?.hide()
             return false
