@@ -154,6 +154,21 @@ open class ChatCaptureService : AccessibilityService() {
 
     private val debounce = Runnable { runAnalysis() }
     private var pendingSnapshot: ChatSnapshot? = null
+
+    /**
+     * #18: WINDOW_STATE_CHANGED blips — the notification shade, a permission
+     * dialog, a split-screen handle — are transient, but the drop branch below
+     * used to tear the bubble down the instant one arrived, and an open panel
+     * was lost mid-read. Hide only if the screen is STILL a drop-zone after a
+     * short grace period; any chat-app event in between cancels the hide.
+     */
+    private val confirmAwayHide = Runnable {
+        val fg = rootInActiveWindow?.packageName?.toString()
+        val stillAway = fg == null || fg == packageName ||
+            fg.contains("launcher", ignoreCase = true) ||
+            fg == "com.miui.home" || fg == "com.android.systemui"
+        if (stillAway) overlay?.hide()
+    }
     @Volatile private var currentSnapshot: ChatSnapshot? = null
     private var foregroundPkg: String? = null
 
@@ -257,7 +272,14 @@ open class ChatCaptureService : AccessibilityService() {
                     fg.contains("launcher", ignoreCase = true) ||
                     fg == "com.miui.home" ||
                     fg == "com.android.systemui"
-                if (drop) overlay?.hide() else overlay?.showIdle(null)
+                if (drop) {
+                    // Grace period instead of an instant tear-down (see [confirmAwayHide]).
+                    main.removeCallbacks(confirmAwayHide)
+                    main.postDelayed(confirmAwayHide, FOREGROUND_CONFIRM_MS)
+                } else {
+                    main.removeCallbacks(confirmAwayHide)
+                    overlay?.showIdle(null)
+                }
                 return
             }
         }
@@ -270,6 +292,8 @@ open class ChatCaptureService : AccessibilityService() {
     }
 
     private fun maybeCapture() {
+        // The chat app is back (or never left): a pending hide confirmation is moot.
+        main.removeCallbacks(confirmAwayHide)
         val root = rootInActiveWindow ?: run { leaveConversation(); overlay?.hide(); return }
         val pkg = root.packageName?.toString()
         // WeChat is fully disabled — no tree read, no screenshot, no OCR, no fill.
@@ -750,6 +774,10 @@ open class ChatCaptureService : AccessibilityService() {
          *  punctuation; steers the user to a still-supported app. */
         private const val WECHAT_DISABLED_MSG =
             "微信已限制读取，请在别的软件上使用"
+
+        /** How long a transient non-chat foreground must persist before the
+         *  bubble is taken away (#18). */
+        private const val FOREGROUND_CONFIRM_MS = 1500L
 
         /** Whole-screen OCR keeps the middle: no action bar, no input area. */
         private const val TOP_CROP = 0.12f
