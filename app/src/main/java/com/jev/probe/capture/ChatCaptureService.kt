@@ -112,8 +112,18 @@ open class ChatCaptureService : AccessibilityService() {
         val title = if (adapter != null) {
             val snapshot = adapter.extract(root, resources) ?: return null
             messagesSignature = snapshot.takeIf { it.messages.isNotEmpty() }?.signature()
-            // A loading/unknown title cannot prove which conversation is open.
-            snapshot.title?.takeUnless { isTransientTitle(it) } ?: return null
+            // A loading/unknown title cannot prove which conversation is open —
+            // unless the SAME app+window already has a known one: animated
+            // headers swap in skeleton/transient titles for a beat (#68), and
+            // unbinding the session there killed in-flight analyses. Keep the
+            // previously verified title instead.
+            val fresh = snapshot.title?.takeUnless { isTransientTitle(it) }
+            if (fresh != null) fresh
+            else {
+                val known = session.target
+                if (known != null && known.pkg == pkg && known.windowId == root.windowId &&
+                    !known.title.isNullOrBlank()) known.title else return null
+            }
         } else {
             findTitleInActionBar(root, Int.MAX_VALUE, resources.displayMetrics.widthPixels,
                 resources, 0.15, 0.85)
@@ -124,8 +134,12 @@ open class ChatCaptureService : AccessibilityService() {
     private fun isCurrent(token: ConversationSession.Token): Boolean {
         if (destroyed || !prefs.enabled || !session.accepts(token)) return false
         val live = rootInActiveWindow?.let { targetFor(it) }
-        if (live == null || !live.sameConversation(token.target) ||
-            !prefs.isAllowed(currentSnapshot?.title ?: live.title)) {
+        // A null re-extract is a transient accessibility glitch (list animation,
+        // node cache miss), NOT proof the chat was left — hiding there killed
+        // freshly rendered candidates on Soul and QQ. Identity checks apply
+        // only when we actually got a reading.
+        if (live != null && (!live.sameConversation(token.target) ||
+            !prefs.isAllowed(currentSnapshot?.title ?: live.title))) {
             leaveConversation()
             overlay?.hide()
             return false
